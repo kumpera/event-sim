@@ -1,0 +1,1 @@
+This repo is a collection of scripts to simulate and benchmark the many approaches to compress logs.
