@@ -1,7 +1,12 @@
-#Overview
+# Overview
 
 This repo is a collection of scripts to simulate and benchmark the many approaches to compress logs.
 
+# Instalation
+
+```
+pip install numpi brotlipy python-snappy zstandard
+```
 
 # TODO
 
