@@ -5,7 +5,7 @@ This repo is a collection of scripts to simulate and benchmark the many approach
 
 # TODO
 
-All those items are suggestions based on what we find to be useful
+All those items are suggestions based on what we find to be useful.
 
 
 ## Intra-batch techniques

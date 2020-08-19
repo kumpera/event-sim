@@ -2,6 +2,8 @@ import argparse;
 import numpy as np;
 import zlib;
 import zstandard as zstd;
+import brotli;
+import snappy;
 
 class LineProcessor:
     def __init__(self, label, max_batch_size):
@@ -57,6 +59,20 @@ class Zstd(LineProcessor):
     def process(self, data):
         return len(zstd.ZstdCompressor(level=self.level).compress(data))
 
+class Brotli(LineProcessor):
+    def __init__(self, level, max_batch_size):
+        super().__init__(f'brotli_{level}', max_batch_size)
+        self.level = level
+    
+    def process(self, data):
+        return len(brotli.compress(data, quality=self.level))
+
+class Snappy(LineProcessor):
+    def __init__(self, max_batch_size):
+        super().__init__('snappy', max_batch_size)
+    
+    def process(self, data):
+        return len(snappy.compress(data))
 
 class Client:
     def __init__(self, id):
@@ -84,22 +100,46 @@ class Client:
 parser = argparse.ArgumentParser(description="Compression simulation")
 parser.add_argument('files', nargs='+', help='Log files to use')
 parser.add_argument('--clients', '-c', type=int, help='Number of clients to use (default 1)', default=1)
+parser.add_argument('--algo', nargs='?', 
+    help='Which compression algorithms to try: zlib, zstd, brotli, snappy (default zstd)', default='ztd')
+# compression dimention
 
 args = parser.parse_args()
-
+algo_names = args.algo.split(',')
 #TODO make it configurable
 MAX_BATCH_SIZE = 198 * 1024
+
+compression_algos = {
+    'zlib': [Deflate, 1, -1, 9],
+    'zstd': [Zstd, -1, 0, 19],
+    'brotli': [Brotli, 0, 3, 11],
+    'snappy': [Snappy]
+}
+
+def gen_compression_list(algos):
+    res = []
+    for name in algos:
+        x = compression_algos[name]
+        if len(x) == 1:
+            res.append(x[0](MAX_BATCH_SIZE))
+        else:
+            res.append(x[0](x[1], MAX_BATCH_SIZE))
+            res.append(x[0](x[2], MAX_BATCH_SIZE))
+            res.append(x[0](x[3], MAX_BATCH_SIZE))
+    return res
 
 clients = []
 for i in range(0, args.clients):
     c = Client(i)
-    c.add_proc(Deflate(1, MAX_BATCH_SIZE))
-    c.add_proc(Deflate(-1, MAX_BATCH_SIZE)) #default
-    c.add_proc(Deflate(9, MAX_BATCH_SIZE))
+    for p in gen_compression_list(algo_names):
+        c.add_proc(p)
+    # c.add_proc(Deflate(1, MAX_BATCH_SIZE))
+    # c.add_proc(Deflate(-1, MAX_BATCH_SIZE)) #default
+    # c.add_proc(Deflate(9, MAX_BATCH_SIZE))
 
-    c.add_proc(Zstd(-1, MAX_BATCH_SIZE))
-    c.add_proc(Zstd(0, MAX_BATCH_SIZE)) #default
-    c.add_proc(Zstd(19, MAX_BATCH_SIZE))
+    # c.add_proc(Zstd(-1, MAX_BATCH_SIZE))
+    # c.add_proc(Zstd(0, MAX_BATCH_SIZE)) #default
+    # c.add_proc(Zstd(19, MAX_BATCH_SIZE))
 
     clients.append(c)
 
