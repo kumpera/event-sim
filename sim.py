@@ -166,7 +166,7 @@ parser = argparse.ArgumentParser(description="Compression simulation")
 parser.add_argument('files', nargs='+', help='Log files to use')
 parser.add_argument('--clients', '-c', type=int, help='Number of clients to use (default 1)', default=1)
 parser.add_argument('--algo', nargs='?', 
-    help='Which compression algorithms to try: zlib, zstd, brotli, snappy, zstd-dict (default zstd)', default='ztd')
+    help='Which compression algorithms to try: zlib, zstd, brotli, snappy, zstd-dict (default zstd)', default='zstd')
 # compression dimention
 
 args = parser.parse_args()
