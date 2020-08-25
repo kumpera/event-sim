@@ -4,6 +4,8 @@ import zlib;
 import zstandard as zstd;
 import brotli;
 import snappy;
+import json;
+import random;
 
 class LineProcessor:
     def __init__(self, label, max_batch_size):
@@ -17,7 +19,7 @@ class LineProcessor:
         self.batches = []
 
     def process(self, data):
-        raise "missing"
+        raise Exception("missing method process")
 
     def on_batch_start(self):
         pass
@@ -80,7 +82,168 @@ class AccumulateBatch(LineProcessor):
         self.batch_done(self.batch_data)
         self.batch_data = []
 
+class Dedup(AccumulateBatch):
+    def __init__(self, label, max_dict_size, max_batch_size):
+        super().__init__(f'dedup_{label}_{max_dict_size}', max_batch_size)
+        self.max_dict_size = max_dict_size
+        self.action_set = dict()
+        self.cur_dict = dict()
+        self.hits = 0
+        self.misses = 0
 
+    def batch_done(self, batch_lines):
+        lst = list(self.action_set.items())
+        lst.sort(key=lambda x: x[1] * len(x[0]), reverse=True)
+        final_dict = dict()
+        total_len = 0
+
+        for kv in lst:
+            if total_len >= self.max_dict_size:
+                break
+            final_dict[kv[0]] = f'id_{random.randint(0, 1_000_000_000)}'
+            total_len += len(kv[0])
+
+        self.cur_dict = final_dict
+        self.action_set = dict()
+        self.hits = self.misses = 0
+
+    def on_batch_start(self):
+        if len(self.cur_dict) > 0:
+            self.add_header_bytes(self.process_header(json.dumps(self.cur_dict)))
+
+    def process(self, data):
+        evt = json.loads(data.decode('utf-8'))
+        actions2 = []
+        for action in evt["c"]["_multi"]:
+            x = json.dumps(action)
+            if x in self.cur_dict:
+                self.hits += 1
+                actions2.append({ '__idx': self.cur_dict[x]})
+            else:
+                self.misses += 1
+                actions2.append(action)
+
+            if x in self.action_set:
+                self.action_set[x] += 1
+            else:
+                self.action_set[x] = 1
+            evt["c"]["_multi"] = actions2
+        return self.process_transformed_event(json.dumps(evt))
+
+class DedupSimple(Dedup):
+    def __init__(self, max_dict_size, max_batch_size):
+        super().__init__('simple', max_dict_size, max_batch_size)
+
+    def process_header(self, dict_dump):
+        return len(dict_dump)
+
+    def process_transformed_event(self, line):
+        return len(line)
+
+class DedupZstd(Dedup):
+    def __init__(self, params, max_batch_size):
+        self.level = params[0]
+        self.max_dict_size = params[1]
+        super().__init__(f'zstd_{self.level}', self.max_dict_size, max_batch_size)
+
+    def process_header(self, dict_dump):
+        data = bytes(dict_dump, 'utf-8')
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+    def process_transformed_event(self, line):
+        data = bytes(line, 'utf-8')
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+class DedupZstdDict(Dedup):
+    def __init__(self, params, max_batch_size):
+        self.level = params[0]
+        self.max_dict_size = params[1]
+        self.max_zdict_size = params[2]
+        self.zdict_lines = []
+        self.cur_zdict = None
+        super().__init__(f'zstd_dict_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
+
+    def batch_done(self, batch_lines):
+        super().batch_done(batch_lines)
+        self.cur_zdict = zstd.train_dictionary(self.max_zdict_size, self.zdict_lines)
+        self.zdict_lines = []
+
+    def compress_and_log(self, text_data):
+        data = bytes(text_data, 'utf-8')
+        self.zdict_lines.append(data)
+        if self.cur_zdict != None:
+            return len(zstd.ZstdCompressor(level=self.level, dict_data=self.cur_zdict).compress(data))
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+    def process_header(self, dict_dump):
+        dedup_dict_size = self.compress_and_log(dict_dump)
+        dict_bytes = self.cur_zdict.as_bytes()
+        comp_dict_size = len(zstd.ZstdCompressor(level=self.level).compress(dict_bytes))
+        return dedup_dict_size + comp_dict_size
+
+    def process_transformed_event(self, line):
+        return self.compress_and_log(line)
+
+#don't zdict compress the actions dict
+class DedupZstdDict2(Dedup):
+    def __init__(self, params, max_batch_size):
+        self.level = params[0]
+        self.max_dict_size = params[1]
+        self.max_zdict_size = params[2]
+        self.zdict_lines = []
+        self.cur_zdict = None
+        super().__init__(f'zstd_dict2_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
+
+    def batch_done(self, batch_lines):
+        super().batch_done(batch_lines)
+        self.cur_zdict = zstd.train_dictionary(self.max_zdict_size, self.zdict_lines)
+        self.zdict_lines = []
+
+    def compress_and_log(self, text_data, use_dict):
+        data = bytes(text_data, 'utf-8')
+        if use_dict:
+            self.zdict_lines.append(data)
+        if self.cur_zdict != None and use_dict:
+            return len(zstd.ZstdCompressor(level=self.level, dict_data=self.cur_zdict).compress(data))
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+    def process_header(self, dict_dump):
+        dedup_dict_size = self.compress_and_log(dict_dump, False)
+        dict_bytes = self.cur_zdict.as_bytes()
+        comp_dict_size = len(zstd.ZstdCompressor(level=self.level).compress(dict_bytes))
+        return dedup_dict_size + comp_dict_size
+
+    def process_transformed_event(self, line):
+        return self.compress_and_log(line, True)
+
+#zdict compress only the actions dict
+class DedupZstdDict3(Dedup):
+    def __init__(self, params, max_batch_size):
+        self.level = params[0]
+        self.max_dict_size = params[1]
+        self.max_zdict_size = params[2]
+        self.cur_zdict = None
+        super().__init__(f'zstd_dict3_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
+
+    def process_header(self, dict_dump):
+        train_data = []
+        for k in self.cur_dict:
+            train_data.append(bytes(k, 'utf-8'))
+        # train on each action independently
+        self.cur_zdict = zstd.train_dictionary(self.max_zdict_size, train_data)
+
+        data = bytes(dict_dump, 'utf-8')
+        dedup_dict_size = len(zstd.ZstdCompressor(level=self.level, dict_data = self.cur_zdict).compress(data))
+
+        dict_bytes = self.cur_zdict.as_bytes()
+        comp_dict_size = len(zstd.ZstdCompressor(level=self.level).compress(dict_bytes))
+        return dedup_dict_size + comp_dict_size
+
+    def process_transformed_event(self, line):
+        data = bytes(line, 'utf-8')
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+# zstd-dict only mode
 class ZstdDict(AccumulateBatch):
     def __init__(self, params, max_batch_size):
         super().__init__(f'zstd_dict_{params[0]}_{params[1]}', max_batch_size)
@@ -101,7 +264,6 @@ class ZstdDict(AccumulateBatch):
         if self.cur_dict == None:
             return len(zstd.ZstdCompressor(level=self.level).compress(data))
         return len(zstd.ZstdCompressor(level=self.level, dict_data=self.cur_dict).compress(data))
-
 
 # Line-a-time compression algos (maybe making them not a subclass of LineProcessor would make it easy to share?)
 class Deflate(LineProcessor):
@@ -166,7 +328,7 @@ parser = argparse.ArgumentParser(description="Compression simulation")
 parser.add_argument('files', nargs='+', help='Log files to use')
 parser.add_argument('--clients', '-c', type=int, help='Number of clients to use (default 1)', default=1)
 parser.add_argument('--algo', nargs='?', 
-    help='Which compression algorithms to try: zlib, zstd, brotli, snappy, zstd-dict (default zstd)', default='zstd')
+    help='Which compression algorithms to try: zlib, zstd, brotli, snappy, zstd-dict,dedup (default zstd)', default='zstd')
 # compression dimention
 
 args = parser.parse_args()
@@ -177,9 +339,14 @@ MAX_BATCH_SIZE = 198 * 1024
 compression_algos = {
     'zlib': [Deflate, 1, -1, 9],
     'zstd': [Zstd, -1, 0, 19],
-    'zstd-dict':[ZstdDict, [0, 10_000], [0, 20_000], [0, 40_000], [0, 80_000], [0, 120_000], [10, 100_000], [19, 160_000] ],
+    'zstd-dict':[ZstdDict, [10, 100_000], [19, 100_000], [19, 160_000], [10, 200_000] ],
     'brotli': [Brotli, 0, 3, 11],
     'snappy': [Snappy],
+    'dedup': [DedupSimple, 10_000, 20_000, 60_000, 100_000],
+    'dedup-zstd': [DedupZstd, [10, 200_000], [10, 240_000], [19, 200_000], [10, 180_000]],
+    'dedup-zstd-dict': [DedupZstdDict, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
+    'dedup-zstd-dict2': [DedupZstdDict2, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
+    'dedup-zstd-dict3': [DedupZstdDict3, [10, 200_000, 10_000], [10, 200_000, 20_000], [10, 200_000, 40_000], [10, 240_000, 40_000], [19, 200_000, 20_000]],
 }
 
 def gen_compression_list(algos):
@@ -204,6 +371,7 @@ for i in range(0, args.clients):
 
 with open(args.files[0], 'r+') as input:
     clients[0].start()
+    cur_line = 0
     for line in input.readlines():
         clients[0].add_line(line)
 
