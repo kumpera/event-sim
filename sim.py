@@ -6,6 +6,7 @@ import brotli;
 import snappy;
 import json;
 import random;
+from tqdm import tqdm;
 
 class LineProcessor:
     def __init__(self, label, max_batch_size):
@@ -96,12 +97,16 @@ class Dedup(AccumulateBatch):
         lst.sort(key=lambda x: x[1] * len(x[0]), reverse=True)
         final_dict = dict()
         total_len = 0
+        actions = 0
 
         for kv in lst:
             if total_len >= self.max_dict_size:
                 break
             final_dict[kv[0]] = f'id_{random.randint(0, 1_000_000_000)}'
             total_len += len(kv[0])
+            actions += 1
+
+        # print(f'new dict {actions}/{len(self.action_set)} actions used')
 
         self.cur_dict = final_dict
         self.action_set = dict()
@@ -318,7 +323,7 @@ class Client:
         for p in self.procs:
             p.start()
 
-    def finish(self):
+    def finish(self, gen_csv):
         print(f'client_{self.id} lines:{self.lines} raw-size:{self.raw_size}')
         for p in self.procs:
             p.report()
@@ -329,7 +334,8 @@ parser.add_argument('files', nargs='+', help='Log files to use')
 parser.add_argument('--clients', '-c', type=int, help='Number of clients to use (default 1)', default=1)
 parser.add_argument('--algo', nargs='?', 
     help='Which compression algorithms to try: zlib, zstd, brotli, snappy, zstd-dict,dedup (default zstd)', default='zstd')
-# compression dimention
+parser.add_argument('--sweep', help="Param sweep the current best know algo (dedup_zstd)", default=False, action='store_true')
+parser.add_argument('--csv', help="Gen stats in csv form", default=False, action='store_true')
 
 args = parser.parse_args()
 algo_names = args.algo.split(',')
@@ -360,19 +366,30 @@ def gen_compression_list(algos):
                 res.append(x[0](x[i], MAX_BATCH_SIZE))
     return res
 
+def gen_sweep_list():
+    res = []
+    for i in range(0, 19):
+        res.append(DedupZstd([i, 200_000], MAX_BATCH_SIZE))
+    for i in range(0, 6):
+        res.append(DedupZstd([1, 140_000 + i * 30_000], MAX_BATCH_SIZE))
+    return res
+
 clients = []
 for i in range(0, args.clients):
     c = Client(i)
-    for p in gen_compression_list(algo_names):
-        c.add_proc(p)
-
+    if args.sweep:
+        for p in gen_sweep_list():
+            c.add_proc(p)
+    else:
+        for p in gen_compression_list(algo_names):
+            c.add_proc(p)
     clients.append(c)
 
 
 with open(args.files[0], 'r+') as input:
     clients[0].start()
     cur_line = 0
-    for line in input.readlines():
+    for line in tqdm(input.readlines()):
         clients[0].add_line(line)
 
-clients[0].finish()
+clients[0].finish(args.csv)
