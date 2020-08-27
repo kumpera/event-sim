@@ -8,7 +8,7 @@ import random;
 # N_ACTIONS_PER_DECISION = 3
 # N_ADF = 20
 
-N_ACTIONS = 600
+N_ACTIONS = 1000
 N_BATCHES = 1
 N_DECISIONS = 2000
 N_ACTIONS_PER_DECISION = 15
@@ -19,7 +19,6 @@ def gen_action():
     for i in range(0, N_ADF):
         res[f'f_{i}'] = random.random()
     return res
-
 
 all_actions = []
 for i in range(0, N_ACTIONS):

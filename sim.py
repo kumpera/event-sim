@@ -27,6 +27,9 @@ class LineProcessor:
 
     def reprocess_across_batches(self):
         return False
+    
+    def gen_specific_csv(Self):
+        return None
 
     def add_header_bytes(self, header_size):
         self.cur_batch_header_size += header_size
@@ -63,6 +66,18 @@ class LineProcessor:
         mean_ratio = np.mean(n[:,1] / n[:,0])
         print(f'\tmean-ratio: {mean_ratio:2.2f} mean-lines:{np.mean(n[:,2]):.1f} mean-header:{int(np.mean(n[:,3]))}')
 
+    def gen_csv(self, header, out_file):
+        n = np.array(self.batches)
+        #label, n_batches, mean_ratio, mean_lines, mean_header, mean_size
+        generic_line = f'{self.label},{len(self.batches)},{np.mean(n[:,1] / n[:,0])},{np.mean(n[:,2])},{np.mean(n[:,3])},{np.mean(n[:,0])}'
+        specific = self.gen_specific_csv()
+        line = f'{header},{generic_line}'
+        if specific != None:
+            line = f'{line},{specific}'
+        out_file.write(line)
+        out_file.write('\n')
+
+
 class AccumulateBatch(LineProcessor):
     def __init__(self, label, max_batch_size):
         super().__init__(label, max_batch_size)
@@ -85,7 +100,7 @@ class AccumulateBatch(LineProcessor):
 
 class Dedup(AccumulateBatch):
     def __init__(self, label, max_dict_size, max_batch_size):
-        super().__init__(f'dedup_{label}_{max_dict_size}', max_batch_size)
+        super().__init__(f'dedup-{label}_{max_dict_size}', max_batch_size)
         self.max_dict_size = max_dict_size
         self.action_set = dict()
         self.cur_dict = dict()
@@ -166,7 +181,7 @@ class DedupZstdDict(Dedup):
         self.max_zdict_size = params[2]
         self.zdict_lines = []
         self.cur_zdict = None
-        super().__init__(f'zstd_dict_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
+        super().__init__(f'zstd-dict_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
 
     def batch_done(self, batch_lines):
         super().batch_done(batch_lines)
@@ -197,7 +212,7 @@ class DedupZstdDict2(Dedup):
         self.max_zdict_size = params[2]
         self.zdict_lines = []
         self.cur_zdict = None
-        super().__init__(f'zstd_dict2_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
+        super().__init__(f'zstd-dict2_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
 
     def batch_done(self, batch_lines):
         super().batch_done(batch_lines)
@@ -228,7 +243,7 @@ class DedupZstdDict3(Dedup):
         self.max_dict_size = params[1]
         self.max_zdict_size = params[2]
         self.cur_zdict = None
-        super().__init__(f'zstd_dict3_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
+        super().__init__(f'zstd-dict3_{self.level}_{self.max_zdict_size}', self.max_dict_size, max_batch_size)
 
     def process_header(self, dict_dump):
         train_data = []
@@ -251,13 +266,19 @@ class DedupZstdDict3(Dedup):
 # zstd-dict only mode
 class ZstdDict(AccumulateBatch):
     def __init__(self, params, max_batch_size):
-        super().__init__(f'zstd_dict_{params[0]}_{params[1]}', max_batch_size)
+        super().__init__(f'zstd-dict_{params[0]}_{params[1]}', max_batch_size)
         self.level = params[0]
         self.train_dict_size = params[1]
         self.cur_dict = None
+        self.acc_lines = []
 
     def batch_done(self, batch_lines):
-        self.cur_dict = zstd.train_dictionary(self.train_dict_size, batch_lines)
+        self.acc_lines.extend(batch_lines)
+        # we truncate before training as in practice we'd keep a size limited history 
+        if len(self.acc_lines) > 400:
+            self.acc_lines = self.acc_lines[-400:]
+
+        self.cur_dict = zstd.train_dictionary(self.train_dict_size, self.acc_lines)
 
     def on_batch_start(self):
         if self.cur_dict != None:
@@ -268,7 +289,10 @@ class ZstdDict(AccumulateBatch):
     def process(self, data):
         if self.cur_dict == None:
             return len(zstd.ZstdCompressor(level=self.level).compress(data))
-        return len(zstd.ZstdCompressor(level=self.level, dict_data=self.cur_dict).compress(data))
+
+        res = len(zstd.ZstdCompressor(level=self.level, dict_data=self.cur_dict).compress(data))
+        # print(f'{self.label} :: {len(self.batches)} :: {res}' )
+        return res
 
 # Line-a-time compression algos (maybe making them not a subclass of LineProcessor would make it easy to share?)
 class Deflate(LineProcessor):
@@ -323,7 +347,12 @@ class Client:
         for p in self.procs:
             p.start()
 
-    def finish(self, gen_csv):
+    def gen_csv(self, file_name, out_file):
+        header = f'{file_name},{self.id},{self.lines},{self.raw_size}'
+        for p in self.procs:
+            p.gen_csv(header, out_file)
+
+    def finish(self):
         print(f'client_{self.id} lines:{self.lines} raw-size:{self.raw_size}')
         for p in self.procs:
             p.report()
@@ -335,7 +364,9 @@ parser.add_argument('--clients', '-c', type=int, help='Number of clients to use 
 parser.add_argument('--algo', nargs='?', 
     help='Which compression algorithms to try: zlib, zstd, brotli, snappy, zstd-dict,dedup (default zstd)', default='zstd')
 parser.add_argument('--sweep', help="Param sweep the current best know algo (dedup_zstd)", default=False, action='store_true')
+parser.add_argument('--sweep2', help="Sweep top two (dedup_zstd and zstd-dict) with a reasonable grid", default=False, action='store_true')
 parser.add_argument('--csv', help="Gen stats in csv form", default=False, action='store_true')
+parser.add_argument('--prefix', help="Prefix for output files", default='')
 
 args = parser.parse_args()
 algo_names = args.algo.split(',')
@@ -345,7 +376,8 @@ MAX_BATCH_SIZE = 198 * 1024
 compression_algos = {
     'zlib': [Deflate, 1, -1, 9],
     'zstd': [Zstd, -1, 0, 19],
-    'zstd-dict':[ZstdDict, [10, 100_000], [19, 100_000], [19, 160_000], [10, 200_000] ],
+    # 'zstd-dict':[ZstdDict, [10, 100_000], [19, 100_000], [19, 160_000], [10, 200_000] ],
+    'zstd-dict':[ZstdDict, [13, 220_000], [13, 140_000] ],
     'brotli': [Brotli, 0, 3, 11],
     'snappy': [Snappy],
     'dedup': [DedupSimple, 10_000, 20_000, 60_000, 100_000],
@@ -374,22 +406,47 @@ def gen_sweep_list():
         res.append(DedupZstd([1, 140_000 + i * 30_000], MAX_BATCH_SIZE))
     return res
 
-clients = []
-for i in range(0, args.clients):
-    c = Client(i)
-    if args.sweep:
-        for p in gen_sweep_list():
-            c.add_proc(p)
+def gen_sweep_list2():
+    res = []
+    # for l in [1, 5, 10, 15, 19]:
+    for l in [1, 13]:
+        # for i in range(0, 11):
+            # max_dict = 100_000 + i * 20_000
+        for max_dict in [80_000, 160_000, 240_000]:
+            res.append(DedupZstd([l, max_dict], MAX_BATCH_SIZE))
+            res.append(ZstdDict([l, max_dict], MAX_BATCH_SIZE))
+            res.append(DedupZstdDict3([l, max_dict, max_dict], MAX_BATCH_SIZE))
+    return res
+
+
+def gen_clients(args):
+    clients = []
+    for i in range(0, args.clients):
+        c = Client(i)
+        if args.sweep:
+            for p in gen_sweep_list():
+                c.add_proc(p)
+        elif args.sweep2:
+            for p in gen_sweep_list2():
+                c.add_proc(p)
+        else:
+            for p in gen_compression_list(algo_names):
+                c.add_proc(p)
+        clients.append(c)
+    return clients
+
+for cur_file in tqdm(args.files):
+    with open(cur_file, 'r+') as input:
+        c = gen_clients(args)[0]
+        c.start()
+        cur_line = 0
+        for line in tqdm(input.readlines()):
+            c.add_line(line)
+
+    if args.csv:
+        with open(f'{args.prefix}{cur_file}.csv', 'w') as stats:
+            stats.write('file,client,total_lines,raw_size,name,n_batches,mean_ratio,mean_lines,mean_header,mean_batch_size\n')
+            c.gen_csv(cur_file, stats)
     else:
-        for p in gen_compression_list(algo_names):
-            c.add_proc(p)
-    clients.append(c)
+        c.finish()
 
-
-with open(args.files[0], 'r+') as input:
-    clients[0].start()
-    cur_line = 0
-    for line in tqdm(input.readlines()):
-        clients[0].add_line(line)
-
-clients[0].finish(args.csv)
