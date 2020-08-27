@@ -31,6 +31,9 @@ class LineProcessor:
     def gen_specific_csv(self):
         return None
 
+    def get_header(self):
+        return None
+
     def add_header_bytes(self, header_size):
         self.cur_batch_header_size += header_size
         self.cur_batch_size += header_size
@@ -106,6 +109,19 @@ class Dedup(AccumulateBatch):
         self.cur_dict = dict()
         self.hits = 0
         self.misses = 0
+        self.dedup_batch_stats = []
+
+    def get_header(self):
+        return 'mean-dict-lines,mean-dict-hit-ratio,mean-action-hit-ratio'
+
+    def gen_specific_csv(self):
+        # mean-dict-lines, mean-dict-hit-ratio, mean-action-hit-ratio
+        n = np.array(self.dedup_batch_stats)
+        mean_dict_lines = np.mean(n[:,0])
+        mean_dict_hit_ratio = np.mean(n[:,1] / n[:,0])
+        mean_action_hit_ratio = np.mean(n[:,2] / (n[:,2] + n[:,3]))
+
+        return f'{mean_dict_lines},{mean_dict_hit_ratio},{mean_action_hit_ratio}'
 
     def batch_done(self, batch_lines):
         lst = list(self.action_set.items())
@@ -114,14 +130,24 @@ class Dedup(AccumulateBatch):
         total_len = 0
         actions = 0
 
+        # don't record stats for first batch as it won't have a dict
+        if len(self.cur_dict) > 0:
+            found_actions = set(self.action_set.keys())
+            used_entries = 0
+            for k in self.cur_dict:
+                if k in found_actions:
+                    used_entries += 1
+
+            log_line = [len(self.cur_dict), used_entries, self.hits, self.misses]
+            self.dedup_batch_stats.append(log_line)
+
+
         for kv in lst:
             if total_len >= self.max_dict_size:
                 break
             final_dict[kv[0]] = f'id_{random.randint(0, 1_000_000_000)}'
             total_len += len(kv[0])
             actions += 1
-
-        # print(f'new dict {actions}/{len(self.action_set)} actions used')
 
         self.cur_dict = final_dict
         self.action_set = dict()
@@ -376,12 +402,11 @@ MAX_BATCH_SIZE = 198 * 1024
 compression_algos = {
     'zlib': [Deflate, 1, -1, 9],
     'zstd': [Zstd, -1, 0, 19],
-    # 'zstd-dict':[ZstdDict, [10, 100_000], [19, 100_000], [19, 160_000], [10, 200_000] ],
     'zstd-dict':[ZstdDict, [13, 220_000], [13, 140_000] ],
     'brotli': [Brotli, 0, 3, 11],
     'snappy': [Snappy],
     'dedup': [DedupSimple, 10_000, 20_000, 60_000, 100_000],
-    'dedup-zstd': [DedupZstd, [10, 200_000], [10, 240_000], [19, 200_000], [10, 180_000]],
+    'dedup-zstd': [DedupZstd, [1, 200_000], [13, 200_000] ],
     'dedup-zstd-dict': [DedupZstdDict, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
     'dedup-zstd-dict2': [DedupZstdDict2, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
     'dedup-zstd-dict3': [DedupZstdDict3, [10, 200_000, 10_000], [10, 200_000, 20_000], [10, 200_000, 40_000], [10, 240_000, 40_000], [19, 200_000, 20_000]],
@@ -405,16 +430,13 @@ def gen_sweep_list():
         res.append(DedupZstd([level, 240_000], MAX_BATCH_SIZE))
     
     # 13 is the previously best well known compression level
-    for i in range(0, 6):
-        res.append(DedupZstd([1, 140_000 + i * 30_000], MAX_BATCH_SIZE))
+    for i in range(8, 30):
+        res.append(DedupZstd([13, i * 10_000], MAX_BATCH_SIZE))
     return res
 
 def gen_sweep_list2():
     res = []
-    # for l in [1, 5, 10, 15, 19]:
     for l in [1, 13]:
-        # for i in range(0, 11):
-            # max_dict = 100_000 + i * 20_000
         for max_dict in [80_000, 160_000, 240_000]:
             res.append(DedupZstd([l, max_dict], MAX_BATCH_SIZE))
             res.append(ZstdDict([l, max_dict], MAX_BATCH_SIZE))
@@ -448,7 +470,10 @@ for cur_file in tqdm(args.files):
 
     if args.csv:
         with open(f'{args.prefix}{cur_file}.csv', 'w') as stats:
-            stats.write('file,client,total_lines,raw_size,name,n_batches,mean_ratio,mean_lines,mean_header,mean_batch_size\n')
+            stats.write('file,client,total_lines,raw_size,name,n_batches,mean_ratio,mean_lines,mean_header,mean_batch_size')
+            if c.procs[0].get_header() != None:
+                stats.write(f',{c.procs[0].get_header()}')
+            stats.write('\n')
             c.gen_csv(cur_file, stats)
     else:
         c.finish()
