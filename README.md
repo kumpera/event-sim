@@ -20,12 +20,42 @@ All those items are suggestions based on what we find to be useful.
 - Compression dict trained on previous batch(es).
     * DONE for zstd
 - Action dedup with dictionary trained on previous batch(es)
+    * DONE
 - Add compression on top of action dedup
+    * DONE
 - double dictionary mode trained on previous batches
+    * DONE
 - double dictionary mode adaptatively trained on current payload
+    * SKIP double dictionary is not promissing
+
+## dedup-zdict experiments
+
+It's clear from the previous batch thay `dedup-zdict` is the best algo to go with.
+It provides the best compression even in the 1k actions scenario that was supposed
+to favor the trained dictionary approach.
+
+### Findings and future work needed:
+
+- Compression doesn't matter at high hit ratios
+- Dictionary size hurts us at low hit ratios
+- Compression quality matters at low hit ratios
+- Dictionary size should be adaptative
+- Building the dictionary from previous batches is not optimal
+- Naive criteria for including an action into the dictionary
+
+
+### Reproducing
+
+1) Run the following:
+```
+python gen-batches.py --name batch --set1
+python sim.py --sweep2 --csv batch_*
+```
+
+2) Open many-algos-ratios.ipynb and evaluate it
+
 
 # Statistics
-et
 - Compression and decompression times
 - Multiple knobs - payload size, dict sizes, etc
 - number of batch overflow bytes (IE, how many bytes we went over the batch limit)

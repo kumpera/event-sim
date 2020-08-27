@@ -28,7 +28,7 @@ class LineProcessor:
     def reprocess_across_batches(self):
         return False
     
-    def gen_specific_csv(Self):
+    def gen_specific_csv(self):
         return None
 
     def add_header_bytes(self, header_size):
@@ -400,8 +400,11 @@ def gen_compression_list(algos):
 
 def gen_sweep_list():
     res = []
-    for i in range(0, 19):
-        res.append(DedupZstd([i, 200_000], MAX_BATCH_SIZE))
+    # 240_000 is the previously know best dict size
+    for level in range(0, 19):
+        res.append(DedupZstd([level, 240_000], MAX_BATCH_SIZE))
+    
+    # 13 is the previously best well known compression level
     for i in range(0, 6):
         res.append(DedupZstd([1, 140_000 + i * 30_000], MAX_BATCH_SIZE))
     return res

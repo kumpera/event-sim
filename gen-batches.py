@@ -1,3 +1,4 @@
+import argparse;
 import json
 import random;
 
@@ -8,45 +9,41 @@ import random;
 # N_ACTIONS_PER_DECISION = 3
 # N_ADF = 20
 
-N_ACTIONS = 1000
-N_BATCHES = 1
-N_DECISIONS = 2000
-N_ACTIONS_PER_DECISION = 15
-N_ADF = 30
+default_config = {
+    "actionCount": 1000, # number of distinct actions
+    "decisionCount": 2000, #number of decisions in the log
+    "actionsPerDecision": 15, #number of arms in each decision
+    "featuresPerAction": 30, #how big is each action
+    "sharedCount": 30, #how big is the shared context
+}
 
-def gen_action():
+def gen_action(config):
     res = dict()
-    for i in range(0, N_ADF):
+    for i in range(0, config["featuresPerAction"]):
         res[f'f_{i}'] = random.random()
     return res
 
-all_actions = []
-for i in range(0, N_ACTIONS):
-    action = gen_action()
-    # hack to ease the compression prototype
-    action["_idx"] = i
-    all_actions.append(action)
+def gen_action_set(config):
+    all_actions = []
+    for i in range(0, config["actionCount"]):
+        all_actions.append(gen_action(config))
+    return all_actions
 
-def gen_decision():
+def gen_decision(config, all_actions):
     decision = dict()
     c = dict()
     decision["Version"] = "1"
     decision["c"] = c
 
     shared_ctx = dict()
-    for i in range(0, 30):
+    for i in range(0, config["sharedCount"]):
         shared_ctx[f'c_{i}'] = random.random()
     c["TShared"] = shared_ctx
-    # {
-    #     "a": 10,
-    #     "b=0": 1,
-    #     "c": "d"
-    # }
     
     actions = set()
     action_list = []
-    while len(actions) < N_ACTIONS_PER_DECISION:
-        idx = random.randint(0, N_ACTIONS - 1)
+    while len(actions) < config["actionsPerDecision"]:
+        idx = random.randint(0, len(all_actions) - 1)
         if not (idx in actions):
             actions.add(idx)
             action_list.append(all_actions[idx])
@@ -54,8 +51,24 @@ def gen_decision():
     c["_multi"] = action_list
     return json.dumps(decision)
 
-for i in range(0, N_BATCHES):
-    with open(f'batch_{i}.in', 'w+') as res:
-        for j in range(0, N_DECISIONS):
-            res.write(gen_decision())
+
+def gen_log(name, config):
+    all_actions = gen_action_set(config)
+    with open(name, 'w+') as res:
+        for j in range(0, config["decisionCount"]):
+            res.write(gen_decision(config, all_actions))
             res.write( "\n")
+
+
+parser = argparse.ArgumentParser(description="Log generation")
+parser.add_argument('--name', help='Name to use for the logs')
+parser.add_argument('--set1', help='Generate 100,200,600,1000 batch of actions', action='store_true')
+
+args = parser.parse_args()
+
+
+if args.set1:
+    for actions in [100, 200, 600, 1000]:
+        config = dict(default_config)
+        config["actionCount"] = actions
+        gen_log(f'{args.name}_{actions}.in', config)
