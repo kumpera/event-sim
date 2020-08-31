@@ -22,7 +22,12 @@ class LineProcessor:
     def process(self, data):
         raise Exception("missing method process")
 
+    #called before anything item is processed
     def on_batch_start(self):
+        pass
+
+    # called after the last item was processed before the batch ends
+    def on_batch_end(self):
         pass
 
     def reprocess_across_batches(self):
@@ -39,6 +44,8 @@ class LineProcessor:
         self.cur_batch_size += header_size
     
     def finish_batch(self):
+        self.on_batch_end()
+
         self.batches.append([self.cur_batch_size, self.cur_batch_raw_size, self.cur_batch_line_count, self.cur_batch_header_size])
 
         self.cur_batch_size = 0
@@ -48,13 +55,16 @@ class LineProcessor:
 
         self.on_batch_start()
 
+    def does_item_overflow(self, item_size, cur_size, max_size):
+        return item_size + cur_size > max_size
+
     def start(self):
         self.on_batch_start()
 
     def add_bytes(self, line):
         original_len = len(line)
         item_size = self.process(line)
-        if item_size + self.cur_batch_size > self.max_batch_size:
+        if self.does_item_overflow(item_size, self.cur_batch_size, self.max_batch_size):
             self.finish_batch()
         if self.reprocess_across_batches():
             item_size = self.process(line)
@@ -114,6 +124,12 @@ class Dedup(AccumulateBatch):
     def get_header(self):
         return 'mean-dict-lines,mean-dict-hit-ratio,mean-action-hit-ratio'
 
+    def register_new_action(self, action):
+       raise Exception("must override")
+
+    def build_dict_from_prev_batch(self):
+        return True
+
     def gen_specific_csv(self):
         # mean-dict-lines, mean-dict-hit-ratio, mean-action-hit-ratio
         n = np.array(self.dedup_batch_stats)
@@ -124,6 +140,15 @@ class Dedup(AccumulateBatch):
         return f'{mean_dict_lines},{mean_dict_hit_ratio},{mean_action_hit_ratio}'
 
     def batch_done(self, batch_lines):
+        if self.build_dict_from_prev_batch() == False:
+            # used entries will always be equal to cur_dict
+            log_line = [len(self.cur_dict), len(self.cur_dict), self.hits, self.misses]
+            self.dedup_batch_stats.append(log_line)
+            self.hits = self.misses = 0
+            self.cur_dict = dict()
+            return
+
+        # this is called after the batch is done
         lst = list(self.action_set.items())
         lst.sort(key=lambda x: x[1] * len(x[0]), reverse=True)
         final_dict = dict()
@@ -141,7 +166,6 @@ class Dedup(AccumulateBatch):
             log_line = [len(self.cur_dict), used_entries, self.hits, self.misses]
             self.dedup_batch_stats.append(log_line)
 
-
         for kv in lst:
             if total_len >= self.max_dict_size:
                 break
@@ -154,8 +178,13 @@ class Dedup(AccumulateBatch):
         self.hits = self.misses = 0
 
     def on_batch_start(self):
-        if len(self.cur_dict) > 0:
+        if len(self.cur_dict) > 0 and self.build_dict_from_prev_batch():
             self.add_header_bytes(self.process_header(json.dumps(self.cur_dict)))
+
+    def on_batch_end(self):
+       if self.build_dict_from_prev_batch() == False:
+           self.add_header_bytes(self.process_header(json.dumps(self.cur_dict)))
+
 
     def process(self, data):
         evt = json.loads(data.decode('utf-8'))
@@ -167,12 +196,17 @@ class Dedup(AccumulateBatch):
                 actions2.append({ '__idx': self.cur_dict[x]})
             else:
                 self.misses += 1
-                actions2.append(action)
+                if self.build_dict_from_prev_batch():
+                    actions2.append(action)
+                else:
+                    actions2.append({ '__idx': self.register_new_action(x) })
 
-            if x in self.action_set:
-                self.action_set[x] += 1
-            else:
-                self.action_set[x] = 1
+            if self.build_dict_from_prev_batch():
+                if x in self.action_set:
+                    self.action_set[x] += 1
+                else:
+                    self.action_set[x] = 1
+
             evt["c"]["_multi"] = actions2
         return self.process_transformed_event(json.dumps(evt))
 
@@ -195,10 +229,54 @@ class DedupZstd(Dedup):
     def process_header(self, dict_dump):
         data = bytes(dict_dump, 'utf-8')
         return len(zstd.ZstdCompressor(level=self.level).compress(data))
+        return res
 
     def process_transformed_event(self, line):
         data = bytes(line, 'utf-8')
         return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+class DedupZstd2(Dedup):
+    def __init__(self, params, max_batch_size):
+        self.level = params[0]
+        self.max_dict_size = params[1]
+        super().__init__(f'zstd2_{self.level}', self.max_dict_size, max_batch_size)
+        self.current_dict_size = 0
+        self.pending_actions = []
+
+    def build_dict_from_prev_batch(self):
+        return False
+
+    def does_item_overflow(self, item_size, cur_size, max_size):
+        # we use this to estimate how big the dictionary will compress to. (we use a static 2.8 compression ratio)
+        estimated_dict_size = self.current_dict_size / 2.8
+        res = item_size + estimated_dict_size + cur_size > max_size
+        if not res:
+            for p in self.pending_actions:
+                self.cur_dict[p[0]] = p[1]
+            self.pending_actions = []
+        return res
+
+    def register_new_action(self, action):
+        self.current_dict_size += len(action)
+        action_id = f'id_{random.randint(0, 1_000_000_000)}'
+        # we want to avoid commiting new entries to the dictionary if we don't have to
+        self.pending_actions.append([action, action_id])
+        return action_id
+
+    def process_transformed_event(self, line):
+        data = bytes(line, 'utf-8')
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+    def process_header(self, dict_dump):
+        data = bytes(dict_dump, 'utf-8')
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+        return res
+
+    def on_batch_end(self):
+        super().on_batch_end()
+        self.current_dict_size = 0
+        self.pending_actions = []
+
 
 class DedupZstdDict(Dedup):
     def __init__(self, params, max_batch_size):
@@ -407,6 +485,7 @@ compression_algos = {
     'snappy': [Snappy],
     'dedup': [DedupSimple, 10_000, 20_000, 60_000, 100_000],
     'dedup-zstd': [DedupZstd, [1, 200_000], [13, 200_000] ],
+    'dedup-zstd2': [DedupZstd2, [1, 200_000], [13, 200_000] ],
     'dedup-zstd-dict': [DedupZstdDict, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
     'dedup-zstd-dict2': [DedupZstdDict2, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
     'dedup-zstd-dict3': [DedupZstdDict3, [10, 200_000, 10_000], [10, 200_000, 20_000], [10, 200_000, 40_000], [10, 240_000, 40_000], [19, 200_000, 20_000]],
@@ -427,11 +506,11 @@ def gen_sweep_list():
     res = []
     # 240_000 is the previously know best dict size
     for level in range(0, 19):
-        res.append(DedupZstd([level, 240_000], MAX_BATCH_SIZE))
+        res.append(DedupZstd2([level, 240_000], MAX_BATCH_SIZE))
     
     # 13 is the previously best well known compression level
     for i in range(8, 30):
-        res.append(DedupZstd([13, i * 10_000], MAX_BATCH_SIZE))
+        res.append(DedupZstd2([13, i * 10_000], MAX_BATCH_SIZE))
     return res
 
 def gen_sweep_list2():
