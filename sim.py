@@ -66,8 +66,8 @@ class LineProcessor:
         item_size = self.process(line)
         if self.does_item_overflow(item_size, self.cur_batch_size, self.max_batch_size):
             self.finish_batch()
-        if self.reprocess_across_batches():
-            item_size = self.process(line)
+            if self.reprocess_across_batches():
+                item_size = self.process(line)
 
         self.cur_batch_size += item_size
         self.cur_batch_raw_size += original_len
@@ -124,7 +124,7 @@ class Dedup(AccumulateBatch):
     def get_header(self):
         return 'mean-dict-lines,mean-dict-hit-ratio,mean-action-hit-ratio'
 
-    def register_new_action(self, action):
+    def register_new_action(self, action, json_action):
        raise Exception("must override")
 
     def build_dict_from_prev_batch(self):
@@ -187,6 +187,8 @@ class Dedup(AccumulateBatch):
 
 
     def process(self, data):
+        # print(f'cur entries: {len(self.cur_dict)}')
+
         evt = json.loads(data.decode('utf-8'))
         actions2 = []
         for action in evt["c"]["_multi"]:
@@ -199,7 +201,7 @@ class Dedup(AccumulateBatch):
                 if self.build_dict_from_prev_batch():
                     actions2.append(action)
                 else:
-                    actions2.append({ '__idx': self.register_new_action(x) })
+                    actions2.append(self.register_new_action(x, action))
 
             if self.build_dict_from_prev_batch():
                 if x in self.action_set:
@@ -208,7 +210,9 @@ class Dedup(AccumulateBatch):
                     self.action_set[x] = 1
 
             evt["c"]["_multi"] = actions2
-        return self.process_transformed_event(json.dumps(evt))
+
+        new_dump = json.dumps(evt)
+        return self.process_transformed_event(new_dump)
 
 class DedupSimple(Dedup):
     def __init__(self, max_dict_size, max_batch_size):
@@ -256,12 +260,12 @@ class DedupZstd2(Dedup):
             self.pending_actions = []
         return res
 
-    def register_new_action(self, action):
+    def register_new_action(self, action, json_action):
         self.current_dict_size += len(action)
         action_id = f'id_{random.randint(0, 1_000_000_000)}'
         # we want to avoid commiting new entries to the dictionary if we don't have to
         self.pending_actions.append([action, action_id])
-        return action_id
+        return { '__idx': action_id }
 
     def process_transformed_event(self, line):
         data = bytes(line, 'utf-8')
@@ -276,6 +280,32 @@ class DedupZstd2(Dedup):
         super().on_batch_end()
         self.current_dict_size = 0
         self.pending_actions = []
+
+
+class DedupZstd3(Dedup):
+    def __init__(self, params, max_batch_size):
+        self.level = params[0]
+        self.max_dict_size = params[1]
+        super().__init__(f'zstd3_{self.level}', self.max_dict_size, max_batch_size)
+
+    def build_dict_from_prev_batch(self):
+        return False
+
+    def register_new_action(self, action, json_action):
+        action_id = f'id_{random.randint(0, 1_000_000_000)}'
+        # we want to avoid commiting new entries to the dictionary if we don't have to
+        self.cur_dict[action] = action_id
+        return json_action
+
+    def process_transformed_event(self, line):
+        data = bytes(line, 'utf-8')
+        return len(zstd.ZstdCompressor(level=self.level).compress(data))
+
+    def process_header(self, dict_dump):
+        # data = bytes(dict_dump, 'utf-8')
+        # return len(zstd.ZstdCompressor(level=self.level).compress(data))
+        # return res
+        return 0
 
 
 class DedupZstdDict(Dedup):
@@ -485,7 +515,10 @@ compression_algos = {
     'snappy': [Snappy],
     'dedup': [DedupSimple, 10_000, 20_000, 60_000, 100_000],
     'dedup-zstd': [DedupZstd, [1, 200_000], [13, 200_000] ],
-    'dedup-zstd2': [DedupZstd2, [1, 200_000], [13, 200_000] ],
+    # 'dedup-zstd2': [DedupZstd2, [1, 200_000], [13, 200_000] ],
+    'dedup-zstd2': [DedupZstd2, [10, 200_000] ],
+    # 'dedup-zstd3': [DedupZstd3, [1, 200_000], [13, 200_000] ],
+    'dedup-zstd3': [DedupZstd3, [10, 200_000] ],
     'dedup-zstd-dict': [DedupZstdDict, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
     'dedup-zstd-dict2': [DedupZstdDict2, [10, 100_000, 100_000], [10, 100_000, 200_000], [10, 200_000, 100_000], [10, 200_000, 200_000]],
     'dedup-zstd-dict3': [DedupZstdDict3, [10, 200_000, 10_000], [10, 200_000, 20_000], [10, 200_000, 40_000], [10, 240_000, 40_000], [19, 200_000, 20_000]],
